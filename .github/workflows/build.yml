@@ -137,6 +137,12 @@ jobs:
           # Flags are the ones recorded in docs/BUILDING.md (read back from the
           # author's CMakeCache), plus switches that stop CMake picking up
           # macOS host libraries.
+          #
+          # CMAKE_MACOSX_BUNDLE=OFF: CMake builds executables as app bundles
+          # when targeting iOS, and LLVM's tablegen install() rule then fails
+          # with "no BUNDLE DESTINATION". LLVM_TABLEGEN points the build at the
+          # host llvm-tblgen from the previous step so it doesn't try to build
+          # its own native copy.
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -155,6 +161,8 @@ jobs:
             -DLLVM_ENABLE_ZSTD=Off \
             -DLLVM_ENABLE_LIBXML2=Off \
             -DLLVM_ENABLE_TERMINFO=Off \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
             -DLLVM_NATIVE_TOOL_DIR="$PWD/toolchains/llvm-host-build/bin"
           cmake --build toolchains/llvm-ios-build
 
