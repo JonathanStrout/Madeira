@@ -1,0 +1,323 @@
+# Builds an unsigned Madeira IPA on GitHub's macOS runners.
+#
+# Save this as .github/workflows/build.yml in your fork.
+#
+# What it does:
+#   1. llvm-ios job: builds the LLVM-for-iOS toolchain DXMT needs. This takes
+#      hours, so it only runs when the cache is empty (first run, or when you
+#      bump LLVM_COMMIT / LLVM_CACHE_VERSION).
+#   2. build job: builds FFmpeg, the Wine unix libs, FEX, DXMT and the pairing
+#      library, then runs xcodebuild and packages an unsigned .ipa.
+#
+# The DLL farm, GnuTLS and the D3D12 runtime are tracked in the repo, so the
+# ARM64EC Windows modules are NOT rebuilt unless you tick "rebuild_pe".
+#
+# The IPA is unsigned on purpose: SideStore / AltStore / Sideloadly re-sign it
+# with your own Apple ID when you install it.
+
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Xcode configuration (Debug is the one that runs games)"
+        type: choice
+        options: [Debug, Release]
+        default: Debug
+      rebuild_pe:
+        description: "Rebuild ARM64EC modules (FEX xtajit64, Wine ntdll, DXMT) instead of using the committed ones"
+        type: boolean
+        default: false
+      include_vcruntime:
+        description: "Download Microsoft's VC++ runtime and bundle it (keep that IPA private, never publish it)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSES/**"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Upstream llvm-project commit from docs/BUILDING.md
+  LLVM_COMMIT: 8dfdcc7b7
+  # Bump to throw away the cached LLVM build and rebuild it
+  LLVM_CACHE_VERSION: v1
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # LLVM for iOS (slow, cached)
+  # ---------------------------------------------------------------------------
+  llvm-ios:
+    name: LLVM for iOS (cached)
+    runs-on: macos-26
+    timeout-minutes: 355
+    steps:
+      - name: Restore cached LLVM
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host-build
+          key: llvm-ios-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}
+
+      - name: Select Xcode
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if [ -d /Applications/Xcode_26.6.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          fi
+          xcodebuild -version
+          df -h /
+
+      - name: Install build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: brew install cmake ninja
+
+      - name: Fetch LLVM source (only the folders the build needs)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The doc only gives a short hash; shallow fetches need the full one.
+          SHA=$(gh api "repos/llvm/llvm-project/commits/${LLVM_COMMIT}" --jq .sha)
+          echo "Using llvm-project $SHA"
+          mkdir -p toolchains/llvm-project
+          cd toolchains/llvm-project
+          git init -q
+          git remote add origin https://github.com/llvm/llvm-project.git
+          git sparse-checkout set --cone llvm cmake third-party
+          git fetch -q --depth 1 --filter=blob:none origin "$SHA"
+          git checkout -q FETCH_HEAD
+          rm -rf .git
+
+      - name: Build host tablegen tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD= \
+            -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_ENABLE_ZLIB=Off \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DLLVM_ENABLE_LIBXML2=Off \
+            -DLLVM_ENABLE_TERMINFO=Off
+          ninja -C toolchains/llvm-host-build llvm-tblgen llvm-min-tblgen
+
+      - name: Build LLVM libraries for iOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Flags are the ones recorded in docs/BUILDING.md (read back from the
+          # author's CMakeCache), plus switches that stop CMake picking up
+          # macOS host libraries.
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_TARGET_ARCH=host \
+            -DLLVM_TARGETS_TO_BUILD= \
+            -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_INCLUDE_EXAMPLES=Off \
+            -DLLVM_INCLUDE_BENCHMARKS=Off \
+            -DLLVM_ENABLE_ZLIB=Off \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DLLVM_ENABLE_LIBXML2=Off \
+            -DLLVM_ENABLE_TERMINFO=Off \
+            -DLLVM_NATIVE_TOOL_DIR="$PWD/toolchains/llvm-host-build/bin"
+          cmake --build toolchains/llvm-ios-build
+
+      - name: Trim cache size
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Object files are the bulk of a CMake build tree; the static
+          # libraries and headers are what the DXMT build uses.
+          find toolchains/llvm-ios-build toolchains/llvm-host-build -name '*.o' -delete
+          du -sh toolchains/*
+
+  # ---------------------------------------------------------------------------
+  # Madeira itself
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build IPA
+    needs: llvm-ios
+    runs-on: macos-26
+    timeout-minutes: 355
+    permissions:
+      contents: write # only used to attach the IPA to a release on tag pushes
+    env:
+      CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+    steps:
+      - name: Check out repo and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_26.6.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h /
+
+      - name: Metal toolchain (Xcode 26 ships it as a separate download)
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja meson bison pkgconf nasm ldid
+          # macOS ships bison 2.3; Wine's tools need 3+
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-apple-ios
+
+      - name: Restore LLVM for iOS
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host-build
+          key: llvm-ios-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}
+          fail-on-cache-miss: true
+
+      # The project requires this folder, but it is git-ignored. Empty is fine:
+      # the official releases do not ship Microsoft's runtime either.
+      - name: Prepare VC++ runtime folder
+        env:
+          INCLUDE_VCRUNTIME: ${{ inputs.include_vcruntime }}
+        run: |
+          mkdir -p app/Madeira/x86_64-vcruntime
+          if [ "$INCLUDE_VCRUNTIME" = "true" ]; then
+            brew install sevenzip
+            curl -fsSL -o /tmp/VC_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+            7zz x /tmp/VC_redist.x64.exe -o/tmp/vcredist -y
+            7zz x /tmp/vcredist/.rsrc/1033/CABINET/*.cab -oapp/Madeira/x86_64-vcruntime -y
+            ls app/Madeira/x86_64-vcruntime
+            test "$(ls app/Madeira/x86_64-vcruntime/*.dll | wc -l)" -ge 12
+          fi
+
+      - name: FFmpeg (LGPL-only)
+        run: bash build/ffmpeg/build.sh
+
+      - name: Wine unix libraries
+        run: |
+          bash build/ntdll-unix/build.sh
+          bash build/wineserver/build.sh
+          bash build/win32u-unix/build.sh
+
+      - name: FEX for iOS
+        run: bash build/fex-ios/build.sh
+
+      - name: DXMT for iOS
+        run: bash build/dxmt-ios/build.sh
+
+      - name: In-app pairing library (Rust)
+        run: bash build/rppairing-ios/build.sh
+
+      # ---- optional: rebuild the ARM64EC Windows side --------------------------
+      - name: llvm-mingw toolchain
+        if: ${{ inputs.rebuild_pe }}
+        run: |
+          VER=20260421
+          NAME="llvm-mingw-${VER}-ucrt-macos-universal"
+          curl -fsSL -o "/tmp/${NAME}.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${VER}/${NAME}.tar.xz"
+          echo "bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7  /tmp/${NAME}.tar.xz" | shasum -a 256 -c -
+          mkdir -p toolchains
+          tar -xJf "/tmp/${NAME}.tar.xz" -C toolchains
+          echo "$PWD/toolchains/${NAME}/bin" >> "$GITHUB_PATH"
+
+      - name: Rebuild ARM64EC modules (FEX, Wine ntdll, DXMT)
+        if: ${{ inputs.rebuild_pe }}
+        run: |
+          bash build/fex-arm64ec/build.sh
+          bash build/wine-pe/build-ntdll.sh
+          meson setup dxmt/build-arm64ec dxmt \
+            -Dbuildtype=release \
+            -Dwine_build_path=../../wine/build-arm64ec \
+            --cross-file=dxmt/build-arm64ec-win.txt
+          ninja -C dxmt/build-arm64ec
+          find dxmt/build-arm64ec \( -name winemetal.dll -o -name d3d11.dll \) \
+            -exec cp -v {} app/Madeira/arm64ec-windows/ \;
+      # --------------------------------------------------------------------------
+
+      # The Xcode build fails if the bundled licence copies are stale.
+      - name: Refresh bundled licences
+        run: bash build/stage-licenses.sh
+
+      - name: Build app (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          APP=$(find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 2 -name 'Madeira.app' -type d | head -n 1)
+          test -n "$APP" || { echo "Madeira.app not found"; exit 1; }
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist")
+
+          # An unsigned build carries no entitlements, and the sideloading tools
+          # copy them from the binary, so pseudo-sign them in with ldid.
+          ENT=$(find app -name '*.entitlements' | head -n 1)
+          if [ -n "$ENT" ]; then
+            echo "Embedding entitlements from $ENT"
+            ldid -S"$ENT" "$APP/$EXE"
+          else
+            echo "No .entitlements file found; the IPA has none."
+          fi
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry Madeira-unsigned.ipa Payload
+          ls -lh Madeira-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-${{ env.CONFIGURATION }}-${{ github.sha }}
+          path: Madeira-unsigned.ipa
+          compression-level: 0
+          retention-days: 7
+
+      # Pushing a tag like v1.0.0 also attaches the IPA to a GitHub release
+      # (tag builds never include Microsoft's runtime).
+      - name: Attach IPA to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Madeira-unsigned.ipa
