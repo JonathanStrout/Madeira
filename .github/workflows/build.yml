@@ -121,7 +121,15 @@ jobs:
             -DLLVM_ENABLE_ZSTD=Off \
             -DLLVM_ENABLE_LIBXML2=Off \
             -DLLVM_ENABLE_TERMINFO=Off
-          ninja -C toolchains/llvm-host-build llvm-tblgen llvm-min-tblgen
+          ninja -C toolchains/llvm-host-build llvm-tblgen
+
+          # Newer LLVM also has llvm-min-tblgen; the pinned commit does not
+          # (ninja: "unknown target"), so only build it if it exists.
+          TARGETS=$(ninja -C toolchains/llvm-host-build -t targets all)
+          if grep -q '^llvm-min-tblgen:' <<<"$TARGETS"; then
+            ninja -C toolchains/llvm-host-build llvm-min-tblgen
+          fi
+          ls toolchains/llvm-host-build/bin
 
       - name: Build LLVM libraries for iOS
         if: steps.cache.outputs.cache-hit != 'true'
