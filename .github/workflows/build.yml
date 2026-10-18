@@ -69,15 +69,30 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 355
     steps:
-      - name: Restore cached LLVM
+      - name: Restore finished LLVM build
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             toolchains/llvm-project
             toolchains/llvm-ios-build
             toolchains/llvm-host-build
           key: llvm-ios-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}
+
+      # A failed job can't save a normal cache, so every attempt also saves
+      # its progress under a "partial" key and the next attempt resumes from
+      # it instead of recompiling everything.
+      - name: Restore partial LLVM build
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host-build
+          key: llvm-ios-partial-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            llvm-ios-partial-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}-
 
       - name: Select Xcode
         if: steps.cache.outputs.cache-hit != 'true'
@@ -97,6 +112,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ -f toolchains/llvm-project/llvm/CMakeLists.txt ]; then
+            echo "LLVM source already present (restored from the partial cache)"
+            exit 0
+          fi
           # The doc only gives a short hash; shallow fetches need the full one.
           SHA=$(gh api "repos/llvm/llvm-project/commits/${LLVM_COMMIT}" --jq .sha)
           echo "Using llvm-project $SHA"
@@ -143,6 +162,10 @@ jobs:
           # with "no BUNDLE DESTINATION". LLVM_TABLEGEN points the build at the
           # host llvm-tblgen from the previous step so it doesn't try to build
           # its own native copy.
+          #
+          # LLVM_NO_DEAD_STRIP=ON: LLVM only treats "Darwin" as macOS, so for
+          # iOS it passes the Linux flag --gc-sections to Apple's linker, which
+          # fails with "ld: unknown options: --gc-sections".
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -162,9 +185,21 @@ jobs:
             -DLLVM_ENABLE_LIBXML2=Off \
             -DLLVM_ENABLE_TERMINFO=Off \
             -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_NO_DEAD_STRIP=ON \
             -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
             -DLLVM_NATIVE_TOOL_DIR="$PWD/toolchains/llvm-host-build/bin"
           cmake --build toolchains/llvm-ios-build
+
+      # Runs even if the build above failed, so the next attempt can resume.
+      - name: Save partial LLVM build
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host-build
+          key: llvm-ios-partial-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Trim cache size
         if: steps.cache.outputs.cache-hit != 'true'
@@ -173,6 +208,16 @@ jobs:
           # libraries and headers are what the DXMT build uses.
           find toolchains/llvm-ios-build toolchains/llvm-host-build -name '*.o' -delete
           du -sh toolchains/*
+
+      - name: Save finished LLVM build
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host-build
+          key: llvm-ios-${{ env.LLVM_COMMIT }}-${{ env.LLVM_CACHE_VERSION }}
 
   # ---------------------------------------------------------------------------
   # Madeira itself
