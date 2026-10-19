@@ -188,7 +188,18 @@ jobs:
             -DLLVM_NO_DEAD_STRIP=ON \
             -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
             -DLLVM_NATIVE_TOOL_DIR="$PWD/toolchains/llvm-host-build/bin"
-          cmake --build toolchains/llvm-ios-build
+
+          # Keep going past failures (-k 0). LLVM's shared-library targets
+          # (LLVMHello, LTO, Remarks) can't link for iOS: for anything that
+          # isn't "Darwin" it writes a Windows-style .def export file, which
+          # Apple's linker rejects ("unknown file type ... .def"). We don't need
+          # them, only the static libraries, so afterwards insist that every
+          # libLLVM*.a target is built.
+          cmake --build toolchains/llvm-ios-build -- -k 0 \
+            || echo "Some non-library targets failed (expected); checking the static libraries..."
+          LIBS=$(ninja -C toolchains/llvm-ios-build -t targets all | sed -n 's/^\(lib\/libLLVM[A-Za-z0-9_]*\.a\):.*/\1/p')
+          echo "$(echo "$LIBS" | wc -l) static libraries expected"
+          ninja -C toolchains/llvm-ios-build $LIBS
 
       # Runs even if the build above failed, so the next attempt can resume.
       - name: Save partial LLVM build
