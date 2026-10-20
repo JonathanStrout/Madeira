@@ -313,6 +313,23 @@ jobs:
           git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
           bash build/freetype-ios/build.sh
 
+      # Wine's configure on an Apple Silicon Mac builds for aarch64 and refuses
+      # to continue without a Windows (PE) cross-compiler: "PE cross-compilation
+      # is required for aarch64". llvm-mingw is that compiler. It is also what
+      # the optional ARM64EC rebuild further down uses, and its folder name is
+      # the one the repo's build scripts expect under toolchains/.
+      - name: llvm-mingw toolchain
+        run: |
+          VER=20260421
+          NAME="llvm-mingw-${VER}-ucrt-macos-universal"
+          curl -fsSL -o "/tmp/${NAME}.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${VER}/${NAME}.tar.xz"
+          echo "bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7  /tmp/${NAME}.tar.xz" | shasum -a 256 -c -
+          mkdir -p toolchains
+          tar -xJf "/tmp/${NAME}.tar.xz" -C toolchains
+          echo "$PWD/toolchains/${NAME}/bin" >> "$GITHUB_PATH"
+          ls "toolchains/${NAME}/bin" | grep -E '^aarch64-w64-mingw32-(clang|gcc)$' || true
+
       # The scripts compile Wine's unix sources with -include
       # wine/build-macos/include/config.h and need the widl-generated headers
       # (mfobjects.h, mftransform.h, dwrite.h, dwrite_3.h) from the same tree.
@@ -402,18 +419,7 @@ jobs:
         run: bash build/rppairing-ios/build.sh
 
       # ---- optional: rebuild the ARM64EC Windows side --------------------------
-      - name: llvm-mingw toolchain
-        if: ${{ inputs.rebuild_pe }}
-        run: |
-          VER=20260421
-          NAME="llvm-mingw-${VER}-ucrt-macos-universal"
-          curl -fsSL -o "/tmp/${NAME}.tar.xz" \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/${VER}/${NAME}.tar.xz"
-          echo "bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7  /tmp/${NAME}.tar.xz" | shasum -a 256 -c -
-          mkdir -p toolchains
-          tar -xJf "/tmp/${NAME}.tar.xz" -C toolchains
-          echo "$PWD/toolchains/${NAME}/bin" >> "$GITHUB_PATH"
-
+      # (uses the llvm-mingw toolchain installed earlier)
       - name: Rebuild ARM64EC modules (FEX, Wine ntdll, DXMT)
         if: ${{ inputs.rebuild_pe }}
         run: |
