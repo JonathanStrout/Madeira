@@ -263,6 +263,11 @@ jobs:
       - name: Install build tools
         run: |
           brew install cmake ninja meson bison pkgconf nasm ldid
+          # gnutls + freetype: only so Wine's configure records
+          # SONAME_LIBGNUTLS / SONAME_LIBFREETYPE in config.h (bcrypt's unix
+          # side does dlopen(SONAME_LIBGNUTLS) and won't compile without it).
+          # The libraries that actually get linked are the iOS builds below.
+          brew install gnutls freetype
           # macOS ships bison 2.3; Wine's tools need 3+
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           rustup target add aarch64-apple-ios
@@ -296,11 +301,96 @@ jobs:
       - name: FFmpeg (LGPL-only)
         run: bash build/ffmpeg/build.sh
 
-      - name: Wine unix libraries
+      # --- inputs the Wine unix-side scripts need but the repo does not ship ---
+      # (found by reading build/ntdll-unix/build.sh: it includes
+      # toolchains/gnutls-ios/include and research/freetype/include, and
+      # compiles against a configured wine/build-macos tree)
+      - name: GnuTLS for iOS (GMP, Nettle, GnuTLS)
+        run: bash build/gnutls-ios/build.sh
+
+      - name: FreeType for iOS
         run: |
-          bash build/ntdll-unix/build.sh
+          git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          bash build/freetype-ios/build.sh
+
+      # The scripts compile Wine's unix sources with -include
+      # wine/build-macos/include/config.h and need the widl-generated headers
+      # (mfobjects.h, mftransform.h, dwrite.h, dwrite_3.h) from the same tree.
+      - name: Wine host tree (config.h and generated headers)
+        run: |
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          ../configure --without-x --disable-tests
+          make -j"$(sysctl -n hw.ncpu)" \
+            include/mfobjects.h include/mftransform.h include/dwrite.h include/dwrite_3.h
+          ls -l include/config.h include/mfobjects.h include/mftransform.h include/dwrite.h include/dwrite_3.h
+          grep -q '^#define SONAME_LIBGNUTLS' include/config.h || {
+            echo "::error::Wine's configure did not find GnuTLS, so SONAME_LIBGNUTLS is missing from config.h"
+            exit 1
+          }
+
+      - name: Wine unix libraries (ntdll)
+        run: bash build/ntdll-unix/build.sh
+
+      # build/wineserver/build.sh does not compile Wine's server from scratch:
+      # it copies a PREBUILT libwineserver.a (app/Madeira/libwineserver.a, which
+      # is git-ignored and not in the repo) and swaps its patched objects in.
+      # Without a base archive it stops with "No base libwineserver.a found".
+      # So this step builds the unpatched server objects first, with the
+      # script's own compiler flags (read out of the script so they can't drift),
+      # and seeds the archive with them. UNVERIFIED: the author's real base
+      # archive may have been built differently.
+      - name: Wine server (seed base archive, then apply the patched objects)
+        run: |
+          set -euo pipefail
+          R="$PWD"
+          WINE_SRC="$R/wine"
+          BUILD_DIR="$R/build/wineserver"
+          SHIMS_DIR="$R/build/ntdll-unix/shims"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          OBJ="$BUILD_DIR/obj"
+          mkdir -p "$OBJ/base"
+          eval "$(sed -n '/^CC_FLAGS=(/,/^)/p' build/wineserver/build.sh)"
+          echo "using ${#CC_FLAGS[@]} compiler flags from build/wineserver/build.sh"
+          # Sources build.sh replaces with its own patched versions, plus the
+          # Linux-only ones (ptrace/procfs).
+          SKIP=" async class event fd handle inproc_sync mach main mapping object process queue region request semaphore sock thread unicode user window winstation procfs ptrace "
+          for f in wine/server/*.c; do
+            n="$(basename "$f" .c)"
+            case "$SKIP" in *" $n "*) continue ;; esac
+            echo -n "  $n... "
+            if xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$f" -o "$OBJ/base/$n.o" 2>"$OBJ/base/$n.err"; then
+              echo OK
+            else
+              echo FAILED
+              head -30 "$OBJ/base/$n.err"
+              exit 1
+            fi
+          done
+          ar rcs "$OBJ/libwineserver.a" "$OBJ"/base/*.o
           bash build/wineserver/build.sh
-          bash build/win32u-unix/build.sh
+
+      - name: Wine unix libraries (win32u)
+        run: bash build/win32u-unix/build.sh
+
+      # The Wine scripts count compile failures but hide the compiler's output
+      # in .err files; print them here so the log shows the real error.
+      - name: Show compiler errors from the Wine scripts
+        if: failure()
+        run: |
+          for d in build/ntdll-unix/obj build/wineserver/obj build/win32u-unix/obj; do
+            [ -d "$d" ] || continue
+            shown=0
+            for f in "$d"/*.err "$d"/err-*.txt; do
+              [ -s "$f" ] || continue
+              if [ "$shown" -lt 4 ]; then
+                echo "::group::$f"; head -30 "$f"; echo "::endgroup::"
+                shown=$((shown + 1))
+              else
+                echo "(more errors in $f)"
+              fi
+            done
+          done
 
       - name: FEX for iOS
         run: bash build/fex-ios/build.sh
