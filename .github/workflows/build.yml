@@ -348,6 +348,26 @@ jobs:
             exit 1
           }
 
+      # server_ios.c prints a diagnostic that reads rusage_info_v6's
+      # ri_page_wait_time_mach, a field the Xcode 26.6 iPhone SDK doesn't have.
+      # Only that one number in a debug log line is affected, so when the SDK
+      # lacks the field it is replaced by 0.0 in the runner's checkout (never
+      # committed). With an SDK that has the field nothing is touched.
+      - name: Work around an SDK difference in server_ios.c
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          if grep -rq 'ri_page_wait_time_mach' "$SDK/usr/include"; then
+            echo "SDK has ri_page_wait_time_mach; nothing to patch"
+          else
+            echo "SDK lacks ri_page_wait_time_mach; patching the diagnostic line"
+            sed -i '' 's/XP_MS( ru\.ri_page_wait_time_mach - pru\.ri_page_wait_time_mach )/0.0/' build/ntdll-unix/server_ios.c
+            if grep -q 'ri_page_wait_time_mach' build/ntdll-unix/server_ios.c; then
+              echo "::error::ri_page_wait_time_mach is still referenced in server_ios.c after patching"
+              grep -n 'ri_page_wait_time_mach' build/ntdll-unix/server_ios.c
+              exit 1
+            fi
+          fi
+
       # build/ntdll-unix/build.sh counts compile failures but hides the
       # compiler's output in obj/*.err, so print the errors of the files that
       # failed (the ones with no .o) when the script fails.
