@@ -490,6 +490,21 @@ jobs:
       - name: DXMT for iOS
         run: bash build/dxmt-ios/build.sh
 
+      # The app links libdxmt_combined.a (DXMT's unix side merged with the LLVM
+      # static libraries airconv needs), not libdxmt_unix.a. build/dxmt-ios/build.sh
+      # only REFRESHES an existing combined archive; it never creates the first
+      # one ("NOTE: ... absent"), so the Xcode link stops with "library
+      # 'dxmt_combined' not found". This is the creation command from
+      # build/dxmt-ios/README.md, plus the copy into app/Madeira.
+      - name: DXMT combined archive (with the LLVM libraries)
+        run: |
+          D=build/dxmt-ios
+          xcrun -sdk iphoneos libtool -static -o "$D/libdxmt_combined.a" \
+            "$D"/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp "$D/libdxmt_combined.a" app/Madeira/libdxmt_combined.a
+          ls -l app/Madeira/libdxmt_combined.a
+          test "$(wc -c < app/Madeira/libdxmt_combined.a)" -gt 10000000
+
       - name: In-app pairing library (Rust)
         run: bash build/rppairing-ios/build.sh
 
