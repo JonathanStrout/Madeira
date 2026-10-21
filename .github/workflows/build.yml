@@ -425,23 +425,6 @@ jobs:
       - name: Wine unix libraries (win32u)
         run: bash build/win32u-unix/build.sh
 
-      # The Wine scripts count compile failures but hide the compiler's output
-      # in .err files (which also hold plain warnings for files that compiled
-      # fine); print the errors of the files that did NOT produce a .o.
-      - name: Show compiler errors from the Wine scripts
-        if: failure()
-        run: |
-          for d in build/ntdll-unix/obj build/wineserver/obj build/win32u-unix/obj; do
-            [ -d "$d" ] || continue
-            for f in "$d"/*.err "$d"/err-*.txt; do
-              [ -s "$f" ] || continue
-              b="$(basename "$f")"; n="${b%.err}"; n="${n#err-}"; n="${n%.txt}"
-              [ -f "$d/$n.o" ] && continue
-              echo "---------- failed to compile: $d/$n ----------"
-              grep -E -B2 -A8 'error' "$f" | head -60
-            done
-          done
-
       # build/fex-ios/build.sh configures with -DCMAKE_SYSTEM_NAME=iOS and
       # nothing else about the CPU. On the runner CMake then leaves
       # CMAKE_SYSTEM_PROCESSOR empty (FEX's CMakeLists.txt:89 and :115 fail on
@@ -466,11 +449,47 @@ jobs:
           grep -n -A4 'cmake -S' "$S"
           bash "$S"
 
+      # airconv_context.cpp includes air_msad.h, air_samplepos.h and
+      # air_tessellation.h: the three helper shaders in dxmt/src/airconv/shaders
+      # compiled to AIR and dumped as C arrays. DXMT's meson build makes them
+      # (src/airconv/meson.build, metalir_generator + hexdump_generator) but
+      # build/dxmt-ios/build.sh only makes dxmt_command.h, so without these the
+      # airconv_context unit fails with "file not found". Same commands as meson.
+      - name: DXMT airconv shader headers
+        run: |
+          H="$PWD/build/dxmt-ios/shader-headers"
+          mkdir -p "$H"
+          cd "$H"
+          for n in air_msad air_samplepos air_tessellation; do
+            xcrun -sdk macosx metal -std="${DXMT_METAL_STD:-metal3.1}" --target=air64-apple-macos14.0 \
+              -o "$n.air" -c "$GITHUB_WORKSPACE/dxmt/src/airconv/shaders/$n.metal"
+            xxd -n "$n" -i "$n.air" "$n.h"
+            ls -l "$n.h"
+            grep -q "unsigned char $n\[\]" "$n.h" || { echo "::error::$n.h has no $n array"; exit 1; }
+          done
+
       - name: DXMT for iOS
         run: bash build/dxmt-ios/build.sh
 
       - name: In-app pairing library (Rust)
         run: bash build/rppairing-ios/build.sh
+
+      # The unix-side scripts (Wine, DXMT) count compile failures but hide the
+      # compiler's output in .err files (which also hold plain warnings for files
+      # that compiled fine); print the errors of the files that did NOT produce a .o.
+      - name: Show compiler errors from the build scripts
+        if: failure()
+        run: |
+          for d in build/ntdll-unix/obj build/wineserver/obj build/win32u-unix/obj build/dxmt-ios/obj; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*.err "$d"/err-*.txt; do
+              [ -s "$f" ] || continue
+              b="$(basename "$f")"; n="${b%.err}"; n="${n#err-}"; n="${n%.txt}"
+              [ -f "$d/$n.o" ] && continue
+              echo "---------- failed to compile: $d/$n ----------"
+              grep -E -B2 -A8 'error' "$f" | head -60
+            done
+          done
 
       # ---- optional: rebuild the ARM64EC Windows side --------------------------
       # (uses the llvm-mingw toolchain installed earlier)
